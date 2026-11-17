@@ -567,17 +567,55 @@
         let currentAlbumFilter = 'ALL';
 
         // Firebase & Cloud Save
+        const LOCAL_SAVE_KEY = 'hikudora_save_data_v1';
         let db = null;
         let auth = null;
         let userId = null;
         let isFirebaseInitialized = false;
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'hissan-subtraction-app';
 
+        function applySaveData(data) {
+            if (!data || typeof data !== 'object') return;
+            if (Array.isArray(data.clearedFlags)) {
+                for (let i = 0; i < TOTAL_QUESTIONS; i++) {
+                    clearedFlags[i] = Boolean(data.clearedFlags[i]);
+                }
+            }
+            if (Array.isArray(data.ownedCards)) {
+                ownedCards = [...data.ownedCards];
+            }
+            if (typeof data.currentGlobalQIdx === 'number' && data.currentGlobalQIdx >= 0 && data.currentGlobalQIdx < TOTAL_QUESTIONS) {
+                currentGlobalQIdx = data.currentGlobalQIdx;
+            }
+            if (clearedFlags[currentGlobalQIdx]) {
+                const nextUncleared = clearedFlags.findIndex(flag => !flag);
+                if (nextUncleared !== -1) {
+                    currentGlobalQIdx = nextUncleared;
+                }
+            }
+        }
+
+        function loadLocalSaveData() {
+            try {
+                const raw = localStorage.getItem(LOCAL_SAVE_KEY);
+                if (!raw) return false;
+                const data = JSON.parse(raw);
+                applySaveData(data);
+                return true;
+            } catch (err) {
+                console.error("Local save load error:", err);
+                return false;
+            }
+        }
+
         async function initFirebase() {
             if (isFirebaseInitialized || !window.firebaseModules) return;
             const { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, getFirestore } = window.firebaseModules;
             const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
-            if (!firebaseConfig) return;
+            if (!firebaseConfig) {
+                await loadSaveData();
+                return;
+            }
 
             isFirebaseInitialized = true;
             const app = initializeApp(firebaseConfig);
@@ -602,33 +640,27 @@
 
         // セーブデータ取得
         async function loadSaveData() {
-            if (!db || !userId) return;
-            try {
-                const { doc, getDoc } = window.firebaseModules;
-                const docRef = doc(db, 'artifacts', appId, 'users', userId, 'progress', 'data');
-                const docSnap = await getDoc(docRef);
-                if (docSnap.exists()) {
-                    const data = docSnap.data();
-                    if (Array.isArray(data.clearedFlags)) {
-                        for (let i = 0; i < TOTAL_QUESTIONS; i++) {
-                            clearedFlags[i] = Boolean(data.clearedFlags[i]);
-                        }
+            const hasLocal = loadLocalSaveData();
+            if (!hasLocal && db && userId) {
+                try {
+                    const { doc, getDoc } = window.firebaseModules;
+                    const docRef = doc(db, 'artifacts', appId, 'users', userId, 'progress', 'data');
+                    const docSnap = await getDoc(docRef);
+                    if (docSnap.exists()) {
+                        const data = docSnap.data();
+                        applySaveData(data);
+                        try {
+                            localStorage.setItem(LOCAL_SAVE_KEY, JSON.stringify({
+                                clearedFlags: clearedFlags,
+                                ownedCards: ownedCards,
+                                currentGlobalQIdx: currentGlobalQIdx,
+                                updatedAt: new Date().toISOString()
+                            }));
+                        } catch (e) {}
                     }
-                    if (Array.isArray(data.ownedCards)) {
-                        ownedCards = data.ownedCards;
-                    }
-                    if (typeof data.currentGlobalQIdx === 'number' && data.currentGlobalQIdx >= 0 && data.currentGlobalQIdx < TOTAL_QUESTIONS) {
-                        currentGlobalQIdx = data.currentGlobalQIdx;
-                    }
-                    if (clearedFlags[currentGlobalQIdx]) {
-                        const nextUncleared = clearedFlags.findIndex(flag => !flag);
-                        if (nextUncleared !== -1) {
-                            currentGlobalQIdx = nextUncleared;
-                        }
-                    }
+                } catch (err) {
+                    console.error("Save load error:", err);
                 }
-            } catch (err) {
-                console.error("Save load error:", err);
             }
             updateCardBadge();
             renderMenuCards();
@@ -639,18 +671,24 @@
 
         // 自動セーブ保存
         async function saveProgress() {
+            const payload = {
+                clearedFlags: clearedFlags,
+                ownedCards: ownedCards,
+                currentGlobalQIdx: currentGlobalQIdx,
+                updatedAt: new Date().toISOString()
+            };
+            try {
+                localStorage.setItem(LOCAL_SAVE_KEY, JSON.stringify(payload));
+            } catch (err) {
+                console.error("Local save write error:", err);
+            }
             updateCardBadge();
             renderMenuCards();
             if (!db || !userId) return;
             try {
                 const { doc, setDoc } = window.firebaseModules;
                 const docRef = doc(db, 'artifacts', appId, 'users', userId, 'progress', 'data');
-                await setDoc(docRef, {
-                    clearedFlags: clearedFlags,
-                    ownedCards: ownedCards,
-                    currentGlobalQIdx: currentGlobalQIdx,
-                    updatedAt: new Date().toISOString()
-                }, { merge: true });
+                await setDoc(docRef, payload, { merge: true });
             } catch (err) {
                 console.error("Save write error:", err);
             }
@@ -751,6 +789,8 @@
 
         // 初期化
         window.onload = async () => {
+            loadLocalSaveData();
+            updateCardBadge();
             setupEventListeners();
             renderMenuCards();
             resizeCanvas();
