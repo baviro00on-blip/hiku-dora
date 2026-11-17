@@ -171,6 +171,9 @@
             initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged,
             getFirestore, doc, getDoc, setDoc
         };
+        if (typeof window.initFirebase === 'function') {
+            window.initFirebase();
+        }
     </script>
 </head>
 <body class="bg-amber-50 h-screen w-screen overflow-hidden flex flex-col p-2 sm:p-4">
@@ -567,14 +570,16 @@
         let db = null;
         let auth = null;
         let userId = null;
+        let isFirebaseInitialized = false;
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'hissan-subtraction-app';
 
         async function initFirebase() {
-            if (!window.firebaseModules) return;
+            if (isFirebaseInitialized || !window.firebaseModules) return;
             const { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, getFirestore } = window.firebaseModules;
             const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
             if (!firebaseConfig) return;
 
+            isFirebaseInitialized = true;
             const app = initializeApp(firebaseConfig);
             auth = getAuth(app);
             db = getFirestore(app);
@@ -593,6 +598,7 @@
             userId = auth.currentUser?.uid || 'guest-user';
             await loadSaveData();
         }
+        window.initFirebase = initFirebase;
 
         // セーブデータ取得
         async function loadSaveData() {
@@ -604,13 +610,21 @@
                 if (docSnap.exists()) {
                     const data = docSnap.data();
                     if (Array.isArray(data.clearedFlags)) {
-                        clearedFlags = data.clearedFlags;
+                        for (let i = 0; i < TOTAL_QUESTIONS; i++) {
+                            clearedFlags[i] = Boolean(data.clearedFlags[i]);
+                        }
                     }
                     if (Array.isArray(data.ownedCards)) {
                         ownedCards = data.ownedCards;
                     }
-                    if (typeof data.currentGlobalQIdx === 'number') {
+                    if (typeof data.currentGlobalQIdx === 'number' && data.currentGlobalQIdx >= 0 && data.currentGlobalQIdx < TOTAL_QUESTIONS) {
                         currentGlobalQIdx = data.currentGlobalQIdx;
+                    }
+                    if (clearedFlags[currentGlobalQIdx]) {
+                        const nextUncleared = clearedFlags.findIndex(flag => !flag);
+                        if (nextUncleared !== -1) {
+                            currentGlobalQIdx = nextUncleared;
+                        }
                     }
                 }
             } catch (err) {
@@ -618,6 +632,9 @@
             }
             updateCardBadge();
             renderMenuCards();
+            if (!document.getElementById('game-screen').classList.contains('hidden')) {
+                renderQuestion();
+            }
         }
 
         // 自動セーブ保存
@@ -633,7 +650,7 @@
                     ownedCards: ownedCards,
                     currentGlobalQIdx: currentGlobalQIdx,
                     updatedAt: new Date().toISOString()
-                });
+                }, { merge: true });
             } catch (err) {
                 console.error("Save write error:", err);
             }
@@ -742,6 +759,16 @@
         };
 
         function setupEventListeners() {
+            // アプリ終了時・画面非表示時の途中経過自動セーブ
+            window.addEventListener('beforeunload', () => {
+                saveProgress();
+            });
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'hidden') {
+                    saveProgress();
+                }
+            });
+
             const soundBtn = document.getElementById('sound-toggle-btn');
             if (soundBtn) {
                 soundBtn.addEventListener('click', () => {
@@ -844,6 +871,7 @@
         function startFromQuestion(globalIdx) {
             currentGlobalQIdx = globalIdx;
             enteredDigits = [];
+            saveProgress();
             document.getElementById('menu-screen').classList.add('hidden');
             document.getElementById('game-screen').classList.remove('hidden');
             document.getElementById('game-screen').classList.add('flex');
@@ -1102,13 +1130,16 @@
             // 次の問題へ進む
             if (currentGlobalQIdx < TOTAL_QUESTIONS - 1) {
                 currentGlobalQIdx++;
+                saveProgress();
                 renderQuestion();
             } else {
                 let nextUncleared = clearedFlags.findIndex(flag => !flag);
                 if (nextUncleared !== -1) {
                     currentGlobalQIdx = nextUncleared;
+                    saveProgress();
                     renderQuestion();
                 } else {
+                    saveProgress();
                     showMenu();
                 }
             }
