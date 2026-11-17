@@ -568,21 +568,163 @@
 
         // Firebase & Cloud Save
         const LOCAL_SAVE_KEY = 'hikudora_save_data_v1';
+        const WINDOW_NAME_PREFIX = '__HIKUDORA_SAVE_V1__:';
+        const IDB_DB_NAME = 'HikudoraLocalStorageDB';
+        const IDB_STORE_NAME = 'progressStore';
+        const IDB_RECORD_KEY = 'main_progress';
+
         let db = null;
         let auth = null;
         let userId = null;
         let isFirebaseInitialized = false;
+        let isDataLoaded = false;
+        let latestSavedTimestamp = 0;
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'hissan-subtraction-app';
 
+        function parseSaveJson(raw) {
+            if (!raw || typeof raw !== 'string') return null;
+            try {
+                const parsed = JSON.parse(raw);
+                return (parsed && typeof parsed === 'object') ? parsed : null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function readFromSyncStorages() {
+            const candidates = [];
+
+            // 1. localStorage
+            try {
+                const rawLocal = window.localStorage.getItem(LOCAL_SAVE_KEY);
+                const parsedLocal = parseSaveJson(rawLocal);
+                if (parsedLocal) candidates.push(parsedLocal);
+            } catch (e) {}
+
+            // 2. sessionStorage
+            try {
+                const rawSession = window.sessionStorage.getItem(LOCAL_SAVE_KEY);
+                const parsedSession = parseSaveJson(rawSession);
+                if (parsedSession) candidates.push(parsedSession);
+            } catch (e) {}
+
+            // 3. window.name
+            try {
+                if (typeof window.name === 'string' && window.name.startsWith(WINDOW_NAME_PREFIX)) {
+                    const parsedWin = parseSaveJson(window.name.slice(WINDOW_NAME_PREFIX.length));
+                    if (parsedWin) candidates.push(parsedWin);
+                }
+            } catch (e) {}
+
+            if (candidates.length === 0) return null;
+
+            // 最も新しいタイムスタンプ（または進捗が多いデータ）を選択
+            candidates.sort((a, b) => {
+                const tsA = typeof a.savedTimestamp === 'number' ? a.savedTimestamp : 0;
+                const tsB = typeof b.savedTimestamp === 'number' ? b.savedTimestamp : 0;
+                if (tsB !== tsA) return tsB - tsA;
+                const scoreA = (Array.isArray(a.clearedFlags) ? a.clearedFlags.filter(Boolean).length : 0) + (Array.isArray(a.ownedCards) ? a.ownedCards.length : 0);
+                const scoreB = (Array.isArray(b.clearedFlags) ? b.clearedFlags.filter(Boolean).length : 0) + (Array.isArray(b.ownedCards) ? b.ownedCards.length : 0);
+                return scoreB - scoreA;
+            });
+
+            return candidates[0];
+        }
+
+        function writeToSyncStorages(payload) {
+            const serialized = JSON.stringify(payload);
+            try {
+                window.localStorage.setItem(LOCAL_SAVE_KEY, serialized);
+            } catch (e) {}
+            try {
+                window.sessionStorage.setItem(LOCAL_SAVE_KEY, serialized);
+            } catch (e) {}
+            try {
+                window.name = WINDOW_NAME_PREFIX + serialized;
+            } catch (e) {}
+        }
+
+        function openLocalIndexedDB() {
+            return new Promise((resolve) => {
+                try {
+                    if (!window.indexedDB) {
+                        resolve(null);
+                        return;
+                    }
+                    const request = window.indexedDB.open(IDB_DB_NAME, 1);
+                    request.onupgradeneeded = (event) => {
+                        try {
+                            const idb = event.target.result;
+                            if (!idb.objectStoreNames.contains(IDB_STORE_NAME)) {
+                                idb.createObjectStore(IDB_STORE_NAME);
+                            }
+                        } catch (e) {}
+                    };
+                    request.onsuccess = (event) => resolve(event.target.result);
+                    request.onerror = () => resolve(null);
+                    request.onblocked = () => resolve(null);
+                } catch (e) {
+                    resolve(null);
+                }
+            });
+        }
+
+        async function readFromIndexedDB() {
+            const idb = await openLocalIndexedDB();
+            if (!idb) return null;
+            return new Promise((resolve) => {
+                try {
+                    const tx = idb.transaction(IDB_STORE_NAME, 'readonly');
+                    const store = tx.objectStore(IDB_STORE_NAME);
+                    const req = store.get(IDB_RECORD_KEY);
+                    req.onsuccess = () => {
+                        const res = req.result;
+                        resolve(res && typeof res === 'object' ? res : null);
+                    };
+                    req.onerror = () => resolve(null);
+                } catch (e) {
+                    resolve(null);
+                }
+            });
+        }
+
+        async function writeToIndexedDB(payload) {
+            const idb = await openLocalIndexedDB();
+            if (!idb) return false;
+            return new Promise((resolve) => {
+                try {
+                    const tx = idb.transaction(IDB_STORE_NAME, 'readwrite');
+                    const store = tx.objectStore(IDB_STORE_NAME);
+                    const req = store.put(payload, IDB_RECORD_KEY);
+                    req.onsuccess = () => resolve(true);
+                    req.onerror = () => resolve(false);
+                } catch (e) {
+                    resolve(false);
+                }
+            });
+        }
+
         function applySaveData(data) {
-            if (!data || typeof data !== 'object') return;
+            if (!data || typeof data !== 'object') return false;
+            const incomingTs = typeof data.savedTimestamp === 'number' ? data.savedTimestamp : 0;
+            if (latestSavedTimestamp > 0 && incomingTs > 0 && incomingTs < latestSavedTimestamp) {
+                return false;
+            }
+            if (incomingTs > 0) {
+                latestSavedTimestamp = incomingTs;
+            }
+
             if (Array.isArray(data.clearedFlags)) {
+                for (let i = 0; i < TOTAL_QUESTIONS; i++) {
+                    clearedFlags[i] = Boolean(data.clearedFlags[i]);
+                }
+            } else if (data.clearedFlags && typeof data.clearedFlags === 'object') {
                 for (let i = 0; i < TOTAL_QUESTIONS; i++) {
                     clearedFlags[i] = Boolean(data.clearedFlags[i]);
                 }
             }
             if (Array.isArray(data.ownedCards)) {
-                ownedCards = [...data.ownedCards];
+                ownedCards = [...new Set(data.ownedCards)];
             }
             if (typeof data.currentGlobalQIdx === 'number' && data.currentGlobalQIdx >= 0 && data.currentGlobalQIdx < TOTAL_QUESTIONS) {
                 currentGlobalQIdx = data.currentGlobalQIdx;
@@ -593,19 +735,34 @@
                     currentGlobalQIdx = nextUncleared;
                 }
             }
+            return true;
         }
 
         function loadLocalSaveData() {
-            try {
-                const raw = localStorage.getItem(LOCAL_SAVE_KEY);
-                if (!raw) return false;
-                const data = JSON.parse(raw);
-                applySaveData(data);
-                return true;
-            } catch (err) {
-                console.error("Local save load error:", err);
-                return false;
+            const syncData = readFromSyncStorages();
+            if (!syncData) return false;
+            return applySaveData(syncData);
+        }
+
+        async function loadIndexedDBSaveData() {
+            const idbData = await readFromIndexedDB();
+            if (!idbData) return false;
+            const applied = applySaveData(idbData);
+            if (applied) {
+                writeToSyncStorages({
+                    clearedFlags: clearedFlags,
+                    ownedCards: ownedCards,
+                    currentGlobalQIdx: currentGlobalQIdx,
+                    savedTimestamp: latestSavedTimestamp || Date.now(),
+                    updatedAt: new Date().toISOString()
+                });
+                updateCardBadge();
+                renderMenuCards();
+                if (!document.getElementById('game-screen').classList.contains('hidden')) {
+                    renderQuestion();
+                }
             }
+            return applied;
         }
 
         async function initFirebase() {
@@ -640,7 +797,10 @@
 
         // セーブデータ取得
         async function loadSaveData() {
-            const hasLocal = loadLocalSaveData();
+            const hasSync = loadLocalSaveData();
+            const hasIdb = await loadIndexedDBSaveData();
+            const hasLocal = hasSync || hasIdb;
+
             if (!hasLocal && db && userId) {
                 try {
                     const { doc, getDoc } = window.firebaseModules;
@@ -648,20 +808,23 @@
                     const docSnap = await getDoc(docRef);
                     if (docSnap.exists()) {
                         const data = docSnap.data();
-                        applySaveData(data);
-                        try {
-                            localStorage.setItem(LOCAL_SAVE_KEY, JSON.stringify({
+                        if (applySaveData(data)) {
+                            const payload = {
                                 clearedFlags: clearedFlags,
                                 ownedCards: ownedCards,
                                 currentGlobalQIdx: currentGlobalQIdx,
+                                savedTimestamp: latestSavedTimestamp || Date.now(),
                                 updatedAt: new Date().toISOString()
-                            }));
-                        } catch (e) {}
+                            };
+                            writeToSyncStorages(payload);
+                            await writeToIndexedDB(payload);
+                        }
                     }
                 } catch (err) {
                     console.error("Save load error:", err);
                 }
             }
+            isDataLoaded = true;
             updateCardBadge();
             renderMenuCards();
             if (!document.getElementById('game-screen').classList.contains('hidden')) {
@@ -671,19 +834,20 @@
 
         // 自動セーブ保存
         async function saveProgress() {
+            const nowTs = Date.now();
+            latestSavedTimestamp = nowTs;
             const payload = {
-                clearedFlags: clearedFlags,
-                ownedCards: ownedCards,
+                clearedFlags: [...clearedFlags],
+                ownedCards: [...ownedCards],
                 currentGlobalQIdx: currentGlobalQIdx,
-                updatedAt: new Date().toISOString()
+                savedTimestamp: nowTs,
+                updatedAt: new Date(nowTs).toISOString()
             };
-            try {
-                localStorage.setItem(LOCAL_SAVE_KEY, JSON.stringify(payload));
-            } catch (err) {
-                console.error("Local save write error:", err);
-            }
+            writeToSyncStorages(payload);
             updateCardBadge();
             renderMenuCards();
+            await writeToIndexedDB(payload);
+
             if (!db || !userId) return;
             try {
                 const { doc, setDoc } = window.firebaseModules;
@@ -788,24 +952,41 @@
         }
 
         // 初期化
-        window.onload = async () => {
+        let isAppBootstrapped = false;
+        async function bootstrapApp() {
+            if (isAppBootstrapped) return;
+            isAppBootstrapped = true;
+
             loadLocalSaveData();
             updateCardBadge();
             setupEventListeners();
             renderMenuCards();
             resizeCanvas();
             window.addEventListener('resize', resizeCanvas);
+
+            await loadIndexedDBSaveData();
+            isDataLoaded = true;
             await initFirebase();
-        };
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', bootstrapApp);
+        } else {
+            bootstrapApp();
+        }
+        window.onload = bootstrapApp;
 
         function setupEventListeners() {
             // アプリ終了時・画面非表示時の途中経過自動セーブ
-            window.addEventListener('beforeunload', () => {
+            const handleAppExitSave = () => {
+                if (!isDataLoaded) return;
                 saveProgress();
-            });
+            };
+            window.addEventListener('beforeunload', handleAppExitSave);
+            window.addEventListener('pagehide', handleAppExitSave);
             document.addEventListener('visibilitychange', () => {
                 if (document.visibilityState === 'hidden') {
-                    saveProgress();
+                    handleAppExitSave();
                 }
             });
 
